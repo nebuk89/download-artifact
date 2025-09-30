@@ -2,11 +2,21 @@ import * as os from 'os'
 import * as path from 'path'
 import * as core from '@actions/core'
 import artifactClient from '@actions/artifact'
-import type {Artifact, FindOptions} from '@actions/artifact'
+import type {Artifact, FindOptions, ListArtifactsOptions} from '@actions/artifact'
+import {getOctokit} from '@actions/github'
 import {Minimatch} from 'minimatch'
 import {Inputs, Outputs} from './constants'
 
 const PARALLEL_DOWNLOADS = 5
+const PUBLIC_API_PAGE_SIZE = 100
+
+interface ApiArtifact {
+  id: number
+  name: string
+  size_in_bytes: number
+  created_at?: string | null
+  digest?: string | null
+}
 
 export const chunk = <T>(arr: T[], n: number): T[][] =>
   arr.reduce((acc, cur, i) => {
@@ -14,6 +24,119 @@ export const chunk = <T>(arr: T[], n: number): T[][] =>
     acc[index] = [...(acc[index] || []), cur]
     return acc
   }, [] as T[][])
+
+function filterLatestArtifacts(artifacts: Artifact[]): Artifact[] {
+  const sortedArtifacts = [...artifacts].sort((a, b) => b.id - a.id)
+  const latestArtifacts: Artifact[] = []
+  const seen = new Set<string>()
+
+  for (const artifact of sortedArtifacts) {
+    if (!seen.has(artifact.name)) {
+      latestArtifacts.push(artifact)
+      seen.add(artifact.name)
+    }
+  }
+
+  return latestArtifacts
+}
+
+function mapApiArtifact(apiArtifact: ApiArtifact): Artifact {
+  return {
+    id: apiArtifact.id,
+    name: apiArtifact.name,
+    size: apiArtifact.size_in_bytes,
+    createdAt: apiArtifact.created_at
+      ? new Date(apiArtifact.created_at)
+      : undefined,
+    digest: apiArtifact.digest ?? undefined
+  }
+}
+
+async function listArtifactsWithPagination(
+  options?: ListArtifactsOptions & FindOptions
+): Promise<Artifact[]> {
+  if (options?.findBy) {
+    return listArtifactsFromPublicApi({
+      ...options,
+      findBy: options.findBy
+    })
+  }
+
+  const response = await artifactClient.listArtifacts(options)
+  return response.artifacts
+}
+
+async function listArtifactsFromPublicApi(
+  options: ListArtifactsOptions & {findBy: NonNullable<FindOptions['findBy']>}
+): Promise<Artifact[]> {
+  const {findBy, latest} = options
+  const {token, repositoryOwner, repositoryName, workflowRunId} = findBy
+
+  if (!token) {
+    throw new Error(
+      `Input 'github-token' is required when using 'repository' and 'run-id' to download artifacts from another workflow run.`
+    )
+  }
+
+  if (!Number.isFinite(workflowRunId) || workflowRunId <= 0) {
+    throw new Error(
+      `Input 'run-id' must be a positive integer when 'github-token' is provided. Received '${workflowRunId}'.`
+    )
+  }
+
+  core.info(
+    `Fetching artifact list for workflow run ${workflowRunId} in repository ${repositoryOwner}/${repositoryName}`
+  )
+
+  const octokit = getOctokit(token)
+  const aggregatedArtifacts: Artifact[] = []
+  let page = 1
+  let totalCount: number | undefined
+
+  while (true) {
+    core.debug(`Fetching artifacts page ${page} (page size: ${PUBLIC_API_PAGE_SIZE})`)
+    const response = await octokit.rest.actions.listWorkflowRunArtifacts({
+      owner: repositoryOwner,
+      repo: repositoryName,
+      run_id: workflowRunId,
+      per_page: PUBLIC_API_PAGE_SIZE,
+      page
+    })
+
+    const apiArtifacts = response.data.artifacts ?? []
+    if (typeof response.data.total_count === 'number') {
+      totalCount = response.data.total_count
+    }
+
+    if (!apiArtifacts.length) {
+      break
+    }
+
+    aggregatedArtifacts.push(
+      ...apiArtifacts.map(apiArtifact => mapApiArtifact(apiArtifact as ApiArtifact))
+    )
+
+    const fetchedAllFromTotal =
+      typeof totalCount === 'number' && aggregatedArtifacts.length >= totalCount
+    const fetchedPartialPage = apiArtifacts.length < PUBLIC_API_PAGE_SIZE
+
+    if (fetchedAllFromTotal || fetchedPartialPage) {
+      break
+    }
+
+    page++
+  }
+
+  core.debug(
+    `Fetched ${aggregatedArtifacts.length} artifact(s) across ${page} page(s) from public API`
+  )
+
+  if (latest) {
+    return filterLatestArtifacts(aggregatedArtifacts)
+  }
+
+  return aggregatedArtifacts
+}
 
 export async function run(): Promise<void> {
   const inputs = {
@@ -69,6 +192,11 @@ export async function run(): Promise<void> {
   let artifacts: Artifact[] = []
   let artifactIds: number[] = []
 
+  const listLatestOptions: ListArtifactsOptions & FindOptions = {
+    latest: true,
+    ...(options.findBy ? {findBy: options.findBy} : {})
+  }
+
   if (isSingleArtifactDownload) {
     core.info(`Downloading single artifact`)
 
@@ -110,12 +238,11 @@ export async function run(): Promise<void> {
     })
 
     // We need to fetch all artifacts to get metadata for the specified IDs
-    const listArtifactResponse = await artifactClient.listArtifacts({
-      latest: true,
-      ...options
-    })
+    const availableArtifacts = await listArtifactsWithPagination(
+      listLatestOptions
+    )
 
-    artifacts = listArtifactResponse.artifacts.filter(artifact =>
+    artifacts = availableArtifacts.filter(artifact =>
       artifactIds.includes(artifact.id)
     )
 
@@ -133,20 +260,20 @@ export async function run(): Promise<void> {
 
     core.debug(`Found ${artifacts.length} artifacts by ID`)
   } else {
-    const listArtifactResponse = await artifactClient.listArtifacts({
-      latest: true,
-      ...options
-    })
-    artifacts = listArtifactResponse.artifacts
+    const availableArtifacts = await listArtifactsWithPagination(
+      listLatestOptions
+    )
+    artifacts = availableArtifacts
 
     core.debug(`Found ${artifacts.length} artifacts in run`)
 
     if (inputs.pattern) {
       core.info(`Filtering artifacts by pattern '${inputs.pattern}'`)
       const matcher = new Minimatch(inputs.pattern)
+      const preFilterCount = availableArtifacts.length
       artifacts = artifacts.filter(artifact => matcher.match(artifact.name))
       core.debug(
-        `Filtered from ${listArtifactResponse.artifacts.length} to ${artifacts.length} artifacts`
+        `Filtered from ${preFilterCount} to ${artifacts.length} artifacts`
       )
     } else {
       core.info(

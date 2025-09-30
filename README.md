@@ -19,6 +19,7 @@ See also [upload-artifact](https://github.com/actions/upload-artifact).
     - [Download All Artifacts](#download-all-artifacts)
     - [Download multiple (filtered) Artifacts to the same directory](#download-multiple-filtered-artifacts-to-the-same-directory)
     - [Download Artifacts from other Workflow Runs or Repositories](#download-artifacts-from-other-workflow-runs-or-repositories)
+    - [Download artifacts from large workflow runs](#download-artifacts-from-large-workflow-runs)
   - [Limitations](#limitations)
     - [Permission Loss](#permission-loss)
 
@@ -35,6 +36,8 @@ Now both methods are consistent:
 - **By ID**: `artifact-ids: 12345` → extracted to `path/` (updated - now direct)
 
 Note: This change also applies to patterns that only match a single artifact.
+
+- Downloads that use a `github-token` now paginate across the GitHub REST API to fetch every artifact in the target run. The previous 1000 artifact ceiling no longer applies when downloading from other runs or repositories.
 
 ## v4 - What's new
 
@@ -308,6 +311,22 @@ steps:
     repository: actions/toolkit
     run-id: 1234
 ```
+
+### Download artifacts from large workflow runs
+
+When a workflow run produces more than 1,000 artifacts, provide a `github-token` with `actions:read` scope (alongside `repository` and `run-id`) and the action will automatically paginate through every page of results:
+
+```yaml
+steps:
+- uses: actions/download-artifact@v5
+  with:
+    github-token: ${{ secrets.PAT_WITH_ACTIONS_READ }}
+    repository: octo-org/monorepo
+    run-id: 987654321
+    path: ./downloaded-artifacts
+```
+
+No additional inputs are required—the action continues requesting subsequent pages (100 artifacts per page) until every artifact is downloaded, even when the total count exceeds the first 1,000 results.
 
 ## Limitations
 

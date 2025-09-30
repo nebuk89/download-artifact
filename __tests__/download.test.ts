@@ -4,6 +4,8 @@ import artifact, {ArtifactNotFoundError} from '@actions/artifact'
 import {run} from '../src/download-artifact'
 import {Inputs} from '../src/constants'
 
+const mockListWorkflowRunArtifacts = jest.fn()
+
 jest.mock('@actions/github', () => ({
   context: {
     repo: {
@@ -12,8 +14,20 @@ jest.mock('@actions/github', () => ({
     },
     runId: 123,
     serverUrl: 'https://github.com'
-  }
+  },
+  getOctokit: jest.fn(() => ({
+    rest: {
+      actions: {
+        listWorkflowRunArtifacts: mockListWorkflowRunArtifacts
+      }
+    }
+  }))
 }))
+
+const {getOctokit: getOctokitMocked} = require('@actions/github') as {
+  getOctokit: jest.Mock
+}
+const mockGetOctokit = getOctokitMocked
 
 jest.mock('@actions/core')
 
@@ -22,38 +36,55 @@ const mockInputs = (overrides?: Partial<{[K in Inputs]?: any}>) => {
   const inputs = {
     [Inputs.Name]: 'artifact-name',
     [Inputs.Path]: '/some/artifact/path',
-    [Inputs.GitHubToken]: 'warn',
-    [Inputs.Repository]: 'owner/some-repository',
-    [Inputs.RunID]: 'some-run-id',
-    [Inputs.Pattern]: 'some-pattern',
+    [Inputs.GitHubToken]: '',
+    [Inputs.Repository]: 'actions/toolkit',
+    [Inputs.RunID]: '123',
+    [Inputs.Pattern]: '',
+    [Inputs.MergeMultiple]: false,
+    [Inputs.ArtifactIds]: '',
     ...overrides
   }
 
+  const inputRecord = inputs as Record<string, any>
+
   ;(core.getInput as jest.Mock).mockImplementation((name: string) => {
-    return inputs[name]
+    return inputRecord[name]
   })
   ;(core.getBooleanInput as jest.Mock).mockImplementation((name: string) => {
-    return inputs[name]
+    return inputRecord[name]
   })
 
   return inputs
 }
 
 describe('download', () => {
-  beforeEach(async () => {
-    mockInputs()
+  beforeEach(() => {
     jest.clearAllMocks()
+
+    mockGetOctokit.mockImplementation(() => ({
+      rest: {
+        actions: {
+          listWorkflowRunArtifacts: mockListWorkflowRunArtifacts
+        }
+      }
+    }))
+
+    mockListWorkflowRunArtifacts.mockResolvedValue({
+      data: {total_count: 0, artifacts: []}
+    })
+
+    mockInputs()
 
     // Mock artifact client methods
     jest
       .spyOn(artifact, 'listArtifacts')
-      .mockImplementation(() => Promise.resolve({artifacts: []}))
+      .mockResolvedValue({artifacts: []})
     jest.spyOn(artifact, 'getArtifact').mockImplementation(name => {
       throw new ArtifactNotFoundError(`Artifact '${name}' not found`)
     })
     jest
       .spyOn(artifact, 'downloadArtifact')
-      .mockImplementation(() => Promise.resolve({digestMismatch: false}))
+      .mockResolvedValue({digestMismatch: false})
   })
 
   test('downloads a single artifact by name', async () => {
@@ -171,22 +202,84 @@ describe('download', () => {
       [Inputs.RunID]: '789'
     })
 
-    jest
-      .spyOn(artifact, 'listArtifacts')
-      .mockImplementation(() => Promise.resolve({artifacts: []}))
+    mockListWorkflowRunArtifacts.mockResolvedValueOnce({
+      data: {total_count: 0, artifacts: []}
+    })
 
     await run()
 
-    expect(artifact.listArtifacts).toHaveBeenCalledWith(
-      expect.objectContaining({
-        findBy: {
-          token,
-          workflowRunId: 789,
-          repositoryName: 'myrepo',
-          repositoryOwner: 'myorg'
-        }
+    expect(mockGetOctokit).toHaveBeenCalledWith(token)
+    expect(mockListWorkflowRunArtifacts).toHaveBeenCalledWith({
+      owner: 'myorg',
+      repo: 'myrepo',
+      run_id: 789,
+      per_page: 100,
+      page: 1
+    })
+    expect(artifact.listArtifacts).not.toHaveBeenCalled()
+  })
+
+  test('paginates when more than 100 artifacts are available via public API', async () => {
+    const token = 'ghp_paginate'
+    const firstPageArtifacts = Array.from({length: 100}, (_, index) => {
+      const id = index + 1
+      return {
+        id,
+        node_id: `node-${id}`,
+        name: `artifact-${id}`,
+        size_in_bytes: 512,
+        url: `https://example.com/${id}`,
+        archive_download_url: `https://example.com/${id}.zip`,
+        expired: false,
+        created_at: new Date().toISOString(),
+        expires_at: null,
+        updated_at: null,
+        workflow_run: undefined,
+        digest: null
+      }
+    })
+
+    const secondPageArtifacts = Array.from({length: 5}, (_, index) => {
+      const id = 101 + index
+      return {
+        id,
+        node_id: `node-${id}`,
+        name: `artifact-${id}`,
+        size_in_bytes: 1024,
+        url: `https://example.com/${id}`,
+        archive_download_url: `https://example.com/${id}.zip`,
+        expired: false,
+        created_at: new Date().toISOString(),
+        expires_at: null,
+        updated_at: null,
+        workflow_run: undefined,
+        digest: null
+      }
+    })
+
+    mockInputs({
+      [Inputs.Name]: '',
+      [Inputs.Pattern]: '',
+      [Inputs.GitHubToken]: token,
+      [Inputs.Repository]: 'actions/toolkit',
+      [Inputs.RunID]: '321'
+    })
+
+    mockListWorkflowRunArtifacts
+      .mockResolvedValueOnce({
+        data: {total_count: 105, artifacts: firstPageArtifacts}
       })
-    )
+      .mockResolvedValueOnce({
+        data: {total_count: 105, artifacts: secondPageArtifacts}
+      })
+
+    await run()
+
+    expect(mockGetOctokit).toHaveBeenCalledWith(token)
+    expect(mockListWorkflowRunArtifacts).toHaveBeenCalledTimes(2)
+    expect(artifact.listArtifacts).not.toHaveBeenCalled()
+    expect(artifact.downloadArtifact).toHaveBeenCalledTimes(105)
+    expect(artifact.downloadArtifact).toHaveBeenCalledWith(105, expect.anything())
   })
 
   test('throws error when repository format is invalid', async () => {
@@ -197,6 +290,19 @@ describe('download', () => {
 
     await expect(run()).rejects.toThrow(
       "Invalid repository: 'invalid-format'. Must be in format owner/repo"
+    )
+  })
+
+  test('throws error when run-id is not a positive integer for cross-repo downloads', async () => {
+    mockInputs({
+      [Inputs.Name]: '',
+      [Inputs.GitHubToken]: 'token-with-perms',
+      [Inputs.Repository]: 'actions/toolkit',
+      [Inputs.RunID]: 'not-a-number'
+    })
+
+    await expect(run()).rejects.toThrow(
+      "Input 'run-id' must be a positive integer when 'github-token' is provided. Received 'NaN'."
     )
   })
 
